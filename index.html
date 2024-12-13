@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>WebRTC Chat Demo</title>
+<style>
+  body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+  }
+  label {
+    display: block;
+    margin-bottom: 10px;
+  }
+  input[type=text] {
+    width: 300px;
+    padding: 5px;
+  }
+  button {
+    margin-right: 10px; 
+    padding: 5px 10px;
+  }
+  #status {
+    margin-top: 20px;
+    color: #333;
+  }
+  #otherHostAudio {
+    margin-top: 20px;
+    width: 300px;
+  }
+</style>
+</head>
+<body>
+<h1>WebRTC Chat Demo</h1>
+
+<label>
+  Media Server WebRTC URL (WebSocket):
+  <input type="text" id="mediaServerUrl" value="ws://<SERVER_URL>:<SERVICE_PORT>/WebRTCAppEE/websocket">
+</label>
+
+<label>
+  Host Publish Stream Key:
+  <input type="text" id="hostStreamKey" value="<HOST_STREAM_KEY>">
+</label>
+
+<label>
+  Other Host Stream Key:
+  <input type="text" id="otherHostStreamKey" value="<OTHER_HOST_STREAM_KEY>">
+</label>
+
+<button id="startChatBtn">Start Chat (Publish)</button>
+<button id="startHearingBtn">Start Hearing (Play)</button>
+
+<div id="status"></div>
+<audio id="otherHostAudio" controls autoplay></audio>
+
+<script>
+  let ws = null;
+  let pc = null;
+  let localStream = null;
+  let remoteStream = null;
+
+  let hostStreamKey = "";
+  let otherHostStreamKey = "";
+  let mediaServerUrl = "";
+
+  let isPublishing = false;
+  let isPlaying = false;
+
+  const startChatBtn = document.getElementById("startChatBtn");
+  const startHearingBtn = document.getElementById("startHearingBtn");
+  const statusDiv = document.getElementById("status");
+  const otherHostAudio = document.getElementById("otherHostAudio");
+
+  startChatBtn.addEventListener("click", startPublishingSequence);
+  startHearingBtn.addEventListener("click", startPlayingSequence);
+
+  function updateStatus(msg) {
+    console.log(msg);
+    statusDiv.textContent = msg;
+  }
+
+  async function initWebSocket() {
+    return new Promise((resolve, reject) => {
+      ws = new WebSocket(mediaServerUrl);
+      ws.onopen = () => {
+        updateStatus("WebSocket connected");
+        resolve();
+      };
+      ws.onmessage = onWebSocketMessage;
+      ws.onerror = (error) => {
+        updateStatus("WebSocket error: " + error);
+        reject(error);
+      };
+      ws.onclose = () => {
+        updateStatus("WebSocket closed");
+      };
+    });
+  }
+
+  async function startPublishingSequence() {
+    mediaServerUrl = document.getElementById("mediaServerUrl").value.trim();
+    hostStreamKey = document.getElementById("hostStreamKey").value.trim();
+
+    if (!mediaServerUrl || !hostStreamKey) {
+      updateStatus("Please provide media server URL and host publish stream key");
+      return;
+    }
+
+    isPublishing = true;
+    isPlaying = false;
+
+    await initWebSocket();
+
+    // Step 1: Send publish command
+    sendJson({
+      command: "publish",
+      streamId: hostStreamKey,
+      audio: true,
+      video: false // assuming audio-only. Set to true if video needed
+    });
+    updateStatus("Publish command sent. Waiting for 'start'...");
+  }
+
+  async function startPlayingSequence() {
+    mediaServerUrl = document.getElementById("mediaServerUrl").value.trim();
+    otherHostStreamKey = document.getElementById("otherHostStreamKey").value.trim();
+
+    if (!mediaServerUrl || !otherHostStreamKey) {
+      updateStatus("Please provide media server URL and other host stream key");
+      return;
+    }
+
+    isPublishing = false;
+    isPlaying = true;
+
+    await initWebSocket();
+
+    // Step 1: Send play command
+    // Similar logic applies for play: send 'play', wait for 'start', then send offer.
+    sendJson({
+      command: "play",
+      streamId: otherHostStreamKey
+    });
+    updateStatus("Play command sent. Waiting for 'start'...");
+  }
+
+  async function onWebSocketMessage(event) {
+    const msg = JSON.parse(event.data);
+
+    switch (msg.command) {
+      case "start":
+        // The server is ready for the offer now
+        updateStatus("Stream started: " + msg.streamId);
+        if (isPublishing && msg.streamId === hostStreamKey) {
+          await sendOffer(hostStreamKey, true);
+        } else if (isPlaying && msg.streamId === otherHostStreamKey) {
+          await sendOffer(otherHostStreamKey, false);
+        }
+        break;
+
+      case "takeConfiguration":
+        await handleTakeConfiguration(msg);
+        break;
+
+      case "takeCandidate":
+        await handleTakeCandidate(msg);
+        break;
+
+      case "notification":
+        // After successful publish, we should eventually get publish_started
+        updateStatus(`Notification: ${msg.definition} for ${msg.streamId}`);
+        break;
+
+      case "error":
+        updateStatus("Error from server: " + msg.definition);
+        break;
+
+      default:
+        console.log("Unknown message from server:", msg);
+    }
+  }
+
+  async function sendOffer(streamId, isPublisher) {
+    try {
+      if (isPublisher) {
+        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      }
+      pc = createPeerConnection(isPublisher);
+      if (isPublisher && localStream) {
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+      }
+
+      const offer = await pc.createOffer({
+        offerToReceiveAudio: !isPublisher,
+        offerToReceiveVideo: false
+      });
+      await pc.setLocalDescription(offer);
+
+      sendJson({
+        command: "takeConfiguration",
+        streamId: streamId,
+        type: "offer",
+        sdp: offer.sdp
+      });
+      updateStatus("Offer sent after receiving 'start' from server.");
+    } catch (e) {
+      updateStatus("Error creating/sending offer: " + e);
+    }
+  }
+
+  function createPeerConnection(isPublisher) {
+    const config = {
+      iceServers: [
+        {urls: "stun:stun1.l.google.com:19302"},
+        {urls: "stun:stun2.l.google.com:19302"}
+      ]
+    };
+    const peer = new RTCPeerConnection(config);
+
+    peer.onicecandidate = (event) => {
+      if (event.candidate) {
+        sendCandidate(isPublisher ? hostStreamKey : otherHostStreamKey, event.candidate);
+      }
+    };
+
+    peer.ontrack = (event) => {
+      if (!remoteStream) {
+        remoteStream = new MediaStream();
+      }
+      remoteStream.addTrack(event.track);
+      otherHostAudio.srcObject = remoteStream;
+      updateStatus("Received remote track, playing...");
+    };
+
+    return peer;
+  }
+
+  function sendCandidate(streamId, candidate) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      sendJson({
+        command: "takeCandidate",
+        streamId: streamId,
+        label: candidate.sdpMLineIndex,
+        id: candidate.sdpMid,
+        candidate: candidate.candidate
+      });
+    } else {
+      console.log("WebSocket is not open, cannot send ICE candidate.");
+    }
+  }
+
+  async function handleTakeConfiguration(msg) {
+    if (msg.type === "answer") {
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }));
+      updateStatus("Remote answer received and set");
+      // After this, ICE candidates exchange and eventually publish_started will be sent by server
+    } else {
+      updateStatus("Received unexpected configuration from server");
+    }
+  }
+
+  async function handleTakeCandidate(msg) {
+    console.log("Received takeCandidate:", msg);
+    if (msg.candidate && msg.candidate !== "") {
+      const candidate = new RTCIceCandidate({
+        candidate: msg.candidate,
+        sdpMid: msg.id,
+        sdpMLineIndex: msg.label
+      });
+      await pc.addIceCandidate(candidate);
+      updateStatus("ICE candidate added.");
+    }
+  }
+
+  function sendJson(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(obj));
+    } else {
+      console.log("WebSocket is not open, cannot send message:", obj);
+    }
+  }
+</script>
+</body>
+</html>
