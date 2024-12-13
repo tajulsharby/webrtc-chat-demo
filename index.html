@@ -99,6 +99,7 @@
     });
   }
 
+  // PUBLISHING SEQUENCE
   async function startPublishingSequence() {
     mediaServerUrl = document.getElementById("mediaServerUrl").value.trim();
     hostStreamKey = document.getElementById("hostStreamKey").value.trim();
@@ -113,16 +114,17 @@
 
     await initWebSocket();
 
-    // Step 1: Send publish command
+    // Send publish command
     sendJson({
       command: "publish",
       streamId: hostStreamKey,
       audio: true,
-      video: false // assuming audio-only. Set to true if video needed
+      video: false // assuming audio-only
     });
     updateStatus("Publish command sent. Waiting for 'start'...");
   }
 
+  // PLAYING SEQUENCE
   async function startPlayingSequence() {
     mediaServerUrl = document.getElementById("mediaServerUrl").value.trim();
     otherHostStreamKey = document.getElementById("otherHostStreamKey").value.trim();
@@ -137,13 +139,12 @@
 
     await initWebSocket();
 
-    // Step 1: Send play command
-    // Similar logic applies for play: send 'play', wait for 'start', then send offer.
+    // Send play command
     sendJson({
       command: "play",
       streamId: otherHostStreamKey
     });
-    updateStatus("Play command sent. Waiting for 'start'...");
+    updateStatus("Play command sent. Waiting for server offer...");
   }
 
   async function onWebSocketMessage(event) {
@@ -151,17 +152,22 @@
 
     switch (msg.command) {
       case "start":
-        // The server is ready for the offer now
-        updateStatus("Stream started: " + msg.streamId);
+        // This is for publish scenario only.
         if (isPublishing && msg.streamId === hostStreamKey) {
-          await sendOffer(hostStreamKey, true);
-        } else if (isPlaying && msg.streamId === otherHostStreamKey) {
-          await sendOffer(otherHostStreamKey, false);
+          updateStatus("Received start for publishing: " + msg.streamId);
+          await sendPublishOffer(hostStreamKey);
         }
         break;
 
       case "takeConfiguration":
-        await handleTakeConfiguration(msg);
+        // In publishing scenario, type=answer is expected from server.
+        // In playing scenario, type=offer is expected first from server.
+        if (msg.type === "offer" && isPlaying && msg.streamId === otherHostStreamKey) {
+          updateStatus("Received offer from server for playing: " + msg.streamId);
+          await handlePlayOffer(msg);
+        } else if (msg.type === "answer" && isPublishing && msg.streamId === hostStreamKey) {
+          await handleAnswerForPublishing(msg);
+        }
         break;
 
       case "takeCandidate":
@@ -169,7 +175,8 @@
         break;
 
       case "notification":
-        // After successful publish, we should eventually get publish_started
+        // After successful publish, we get publish_started
+        // After successful play, we get play_started
         updateStatus(`Notification: ${msg.definition} for ${msg.streamId}`);
         break;
 
@@ -182,20 +189,14 @@
     }
   }
 
-  async function sendOffer(streamId, isPublisher) {
+  // Sending Offer for Publishing after receiving 'start'
+  async function sendPublishOffer(streamId) {
     try {
-      if (isPublisher) {
-        localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-      }
-      pc = createPeerConnection(isPublisher);
-      if (isPublisher && localStream) {
-        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-      }
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      pc = createPeerConnection(true);
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-      const offer = await pc.createOffer({
-        offerToReceiveAudio: !isPublisher,
-        offerToReceiveVideo: false
-      });
+      const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
       await pc.setLocalDescription(offer);
 
       sendJson({
@@ -204,9 +205,57 @@
         type: "offer",
         sdp: offer.sdp
       });
-      updateStatus("Offer sent after receiving 'start' from server.");
+      updateStatus("Publishing offer sent after 'start'.");
     } catch (e) {
-      updateStatus("Error creating/sending offer: " + e);
+      updateStatus("Error creating/sending publish offer: " + e);
+    }
+  }
+
+  // Handling the offer from server for playing scenario
+  async function handlePlayOffer(msg) {
+    try {
+      // msg.sdp is the offer from the server
+      pc = createPeerConnection(false);
+
+      // Set server's offer as remote description
+      await pc.setRemoteDescription(new RTCSessionDescription({ type: "offer", sdp: msg.sdp }));
+      
+      // Create answer
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      // Send answer back to server
+      sendJson({
+        command: "takeConfiguration",
+        streamId: msg.streamId,
+        type: "answer",
+        sdp: answer.sdp
+      });
+
+      updateStatus("Answer sent in response to server offer for playing.");
+    } catch (e) {
+      updateStatus("Error handling play offer: " + e);
+    }
+  }
+
+  async function handleAnswerForPublishing(msg) {
+    // For publishing scenario, once we get answer from server
+    await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }));
+    updateStatus("Remote answer received and set for publishing.");
+    // After this, ICE candidates exchange and eventually publish_started will be received.
+  }
+
+  async function handleTakeCandidate(msg) {
+    console.log("Received takeCandidate:", msg);
+    // For both publish and play scenario, just add the ICE candidate
+    if (msg.candidate && msg.candidate !== "") {
+      const candidate = new RTCIceCandidate({
+        candidate: msg.candidate,
+        sdpMid: msg.id,
+        sdpMLineIndex: msg.label
+      });
+      await pc.addIceCandidate(candidate);
+      updateStatus("ICE candidate added.");
     }
   }
 
@@ -248,29 +297,6 @@
       });
     } else {
       console.log("WebSocket is not open, cannot send ICE candidate.");
-    }
-  }
-
-  async function handleTakeConfiguration(msg) {
-    if (msg.type === "answer") {
-      await pc.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: msg.sdp }));
-      updateStatus("Remote answer received and set");
-      // After this, ICE candidates exchange and eventually publish_started will be sent by server
-    } else {
-      updateStatus("Received unexpected configuration from server");
-    }
-  }
-
-  async function handleTakeCandidate(msg) {
-    console.log("Received takeCandidate:", msg);
-    if (msg.candidate && msg.candidate !== "") {
-      const candidate = new RTCIceCandidate({
-        candidate: msg.candidate,
-        sdpMid: msg.id,
-        sdpMLineIndex: msg.label
-      });
-      await pc.addIceCandidate(candidate);
-      updateStatus("ICE candidate added.");
     }
   }
 
